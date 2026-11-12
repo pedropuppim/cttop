@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""cttop - monitor de terminal para containers (Proxmox CT / LXC).
+
+Mostra apenas os CPUs que o container pode usar, o uso real do container,
+memoria, swap e os principais processos. Arquivo unico, sem dependencias.
+
+Uso: cttop [-d SEGUNDOS]      Teclas: c = ordenar por CPU, m = por memoria, q = sair
+"""
+import argparse
+import collections
+import curses
+import locale
+import os
+import pwd
+import socket
+import time
+
+CLK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+GRADIENT = [46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196]
+
+UTF = {"tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│",
+       "bar": "■", "blocks": " ▁▂▃▄▅▆▇█", "dot": "·", "down": "▼"}
+ASCII = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
+         "bar": "#", "blocks": "  ..::||##", "dot": "-", "down": "v"}
+CH = UTF
+
+
+# ───────────────────────── coleta ─────────────────────────
+
+def read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def cpu_times():
+    """{cpu_id: (idle, total)} a partir de /proc/stat."""
+    out = {}
+    for line in (read("/proc/stat") or "").splitlines():
+        if line.startswith("cpu") and line[3:4].isdigit():
+            p = line.split()
+            v = [int(x) for x in p[1:9]]
+            v += [0] * (8 - len(v))
+            out[int(p[0][3:])] = (v[3] + v[4], sum(v))
+    return out
+
+
+def visible_cpus(stat_ids):
+    """CPUs que este container realmente pode usar."""
+    try:
+        aff = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        aff = set()
+    if aff and aff <= set(stat_ids):
+        return sorted(aff)
+    return sorted(stat_ids)
+
+
+def cgroup_usage_usec():
+    """Tempo de CPU consumido pelo container inteiro (None se indisponivel)."""
+    txt = read("/sys/fs/cgroup/cpu.stat")
+    if txt:
+        for line in txt.splitlines():
+            if line.startswith("usage_usec"):
+                return int(line.split()[1])
+    for p in ("/sys/fs/cgroup/cpuacct/cpuacct.usage",
+              "/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"):
+        txt = read(p)
+        if txt:
+            return int(txt.strip()) // 1000
+    return None
+
+
+def cpu_quota():
+    """Limite de CPU em nucleos (None = sem limite)."""
+    txt = read("/sys/fs/cgroup/cpu.max")
+    if txt:
+        p = txt.split()
+        if len(p) == 2 and p[0] != "max":
+            return int(p[0]) / int(p[1])
+        return None
+    q = read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    per = read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if q and per and int(q) > 0:
+        return int(q) / int(per)
+    return None
+
+
+def cpu_pressure():
+    """% do tempo (ultimos 10s) em que processos esperaram por CPU."""
+    for p in ("/sys/fs/cgroup/cpu.pressure", "/proc/pressure/cpu"):
+        txt = read(p)
+        if txt:
+            for tok in txt.splitlines()[0].split():
+                if tok.startswith("avg10="):
+                    return float(tok[6:])
+    return None
+
+
+def meminfo():
+    m = {}
+    for line in (read("/proc/meminfo") or "").splitlines():
+        k, _, v = line.partition(":")
+        v = v.split()
+        if v:
+            m[k] = int(v[0]) * 1024
+    total = m.get("MemTotal", 0)
+    cache = max(0, m.get("Cached", 0) + m.get("SReclaimable", 0)
+                + m.get("Buffers", 0) - m.get("Shmem", 0))
+    used = max(0, total - m.get("MemFree", 0) - cache)
+    stotal = m.get("SwapTotal", 0)
+    return {"total": total, "used": used, "cache": cache,
+            "swap_total": stotal, "swap_used": stotal - m.get("SwapFree", 0)}
+
+
+_pcache = {}
+
+
+def processes():
+    """{pid: dict} com um registro por processo (sem threads)."""
+    out = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        txt = read("/proc/%s/stat" % name)
+        if not txt:
+            continue
+        try:
+            l, r = txt.index("("), txt.rindex(")")
+            f = txt[r + 2:].split()
+            pid = int(name)
+            start = int(f[19])
+            info = _pcache.get(pid)
+            if info is None or info[0] != start:
+                cmd = (read("/proc/%s/cmdline" % name) or "").replace("\0", " ").strip()
+                if not cmd:
+                    cmd = "[%s]" % txt[l + 1:r]
+                uid = os.stat("/proc/%s" % name).st_uid
+                try:
+                    user = pwd.getpwuid(uid).pw_name
+                except KeyError:
+                    user = str(uid)
+                info = _pcache[pid] = (start, cmd, user)
+            out[pid] = {"pid": pid, "state": f[0], "ticks": int(f[11]) + int(f[12]),
+                        "threads": int(f[17]), "rss": int(f[21]) * PAGE,
+                        "start": start, "cmd": info[1], "user": info[2], "cpu": 0.0}
+        except (ValueError, IndexError, OSError):
+            continue
+    for pid in list(_pcache):
+        if pid not in out:
+            del _pcache[pid]
+    return out
+
+
+class Sampler:
+    def __init__(self):
+        self.history = collections.deque(maxlen=2000)
+        self.prev = None
+        self.data = None
+
+    def sample(self):
+        now = time.monotonic()
+        cur = {"t": now, "cpu": cpu_times(), "usage": cgroup_usage_usec(),
+               "procs": processes()}
+        prev, self.prev = self.prev, cur
+        if prev is None:
+            return
+        dt = max(1e-6, now - prev["t"])
+        ids = visible_cpus(cur["cpu"])
+        cores = []
+        for i in ids:
+            a, b = prev["cpu"].get(i), cur["cpu"][i]
+            frac = 0.0
+            if a and b[1] > a[1]:
+                frac = 1.0 - (b[0] - a[0]) / (b[1] - a[1])
+            cores.append((i, min(1.0, max(0.0, frac))))
+        quota = cpu_quota()
+        capacity = float(len(ids) or 1)
+        if quota:
+            capacity = min(capacity, quota)
+        if cur["usage"] is not None and prev["usage"] is not None:
+            total = (cur["usage"] - prev["usage"]) / (dt * 1e6 * capacity)
+        else:
+            total = sum(c[1] for c in cores) / capacity
+        total = min(1.0, max(0.0, total))
+        self.history.append(total)
+
+        mem = meminfo()
+        procs = cur["procs"]
+        for pid, p in procs.items():
+            old = prev["procs"].get(pid)
+            if old and old["start"] == p["start"]:
+                p["cpu"] = max(0.0, (p["ticks"] - old["ticks"]) / CLK / dt / capacity)
+        up = read("/proc/uptime")
+        self.data = {
+            "cores": cores, "total": total, "capacity": capacity, "quota": quota,
+            "mem": mem, "procs": list(procs.values()),
+            "running": sum(1 for p in procs.values() if p["state"] == "R"),
+            "threads": sum(p["threads"] for p in procs.values()),
+            "pressure": cpu_pressure(),
+            "uptime": float(up.split()[0]) if up else 0.0,
+        }
+
+
+# ───────────────────────── desenho ─────────────────────────
+
+def human(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return ("%d%s" % (n, unit)) if unit in "BK" or n >= 100 else "%.1f%s" % (n, unit)
+        n /= 1024.0
+
+
+def fmt_uptime(s):
+    d, s = divmod(int(s), 86400)
+    h, s = divmod(s, 3600)
+    return ("%dd %02d:%02d" % (d, h, s // 60)) if d else "%02d:%02d" % (h, s // 60)
+
+
+def fmt_time(ticks):
+    s = ticks // CLK
+    h, s = divmod(s, 3600)
+    return "%d:%02d:%02d" % (h, s // 60, s % 60)
+
+
+class UI:
+    def __init__(self, scr):
+        self.scr = scr
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.rich = curses.COLORS >= 256
+        if self.rich:
+            for i, c in enumerate(GRADIENT):
+                curses.init_pair(1 + i, c, -1)
+            pairs = {"dim": 238, "border": 39, "label": 245, "cache": 33, "title": 255}
+        else:
+            for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED)):
+                curses.init_pair(1 + i, c, -1)
+            pairs = {"dim": curses.COLOR_BLUE, "border": curses.COLOR_CYAN, "label": -1,
+                     "cache": curses.COLOR_BLUE, "title": -1}
+        self.c = {}
+        for n, (k, col) in enumerate(pairs.items()):
+            curses.init_pair(20 + n, col, -1)
+            self.c[k] = curses.color_pair(20 + n)
+        self.c["title"] |= curses.A_BOLD
+        self.steps = len(GRADIENT) if self.rich else 3
+
+    def grad(self, frac):
+        i = min(self.steps - 1, max(0, int(frac * self.steps)))
+        return curses.color_pair(1 + i)
+
+    def put(self, y, x, s, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w or x < 0:
+            return
+        s = s[:w - x - (1 if y == h - 1 else 0)]
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass
+
+    def box(self, y, x, h, w, title, right=""):
+        b = self.c["border"]
+        self.put(y, x, CH["tl"] + CH["h"] * (w - 2) + CH["tr"], b)
+        for i in range(1, h - 1):
+            self.put(y + i, x, CH["v"], b)
+            self.put(y + i, x + w - 1, CH["v"], b)
+        self.put(y + h - 1, x, CH["bl"] + CH["h"] * (w - 2) + CH["br"], b)
+        self.put(y, x + 2, " %s " % title, self.c["title"])
+        if right and len(right) + len(title) + 10 < w:
+            self.put(y, x + w - len(right) - 4, " %s " % right, self.c["label"])
+
+    def bar(self, y, x, w, frac, frac2=0.0):
+        """Barra com gradiente; frac2 = segundo segmento (cache)."""
+        n1 = int(round(frac * w))
+        n2 = int(round((frac + frac2) * w))
+        for i in range(w):
+            if i < n1:
+                attr = self.grad((i + 0.5) / w) | curses.A_BOLD
+            elif i < n2:
+                attr = self.c["cache"]
+            else:
+                attr = self.c["dim"]
+            self.put(y, x + i, CH["bar"], attr)
+
+    def graph(self, y, x, h, w, values):
+        vals = list(values)[-w:]
+        off = w - len(vals)
+        blocks = CH["blocks"]
+        for col, v in enumerate(vals):
+            level = v * h * 8
+            for row in range(h):
+                e = int(min(8, max(0, round(level - row * 8))))
+                if row == 0 and e == 0:
+                    e = 1
+                if e:
+                    self.put(y + h - 1 - row, x + off + col, blocks[e],
+                             self.grad((row + 0.5) / h))
+
+    def draw(self, d, sort, interval):
+        scr = self.scr
+        scr.erase()
+        H, W = scr.getmaxyx()
+        if d is None or W < 40 or H < 8:
+            self.put(0, 0, "cttop: coletando..." if d is None else "terminal pequeno demais")
+            scr.refresh()
+            return
+        iw = W - 4
+        cores = d["cores"]
+        n = len(cores)
+
+        # ── CPU ──
+        cell = 24
+        ncols = max(1, min(n, iw // cell))
+        cell = iw // ncols
+        crows = -(-n // ncols)
+        gh = 5 if H >= 34 else 3 if H >= 24 else 0
+        if H - (crows + gh + 4) - 4 < 6:
+            gh = 0
+        ch = crows + gh + 4
+        cap = d["capacity"]
+        capn = ("%d" % cap) if cap == int(cap) else "%.1f" % cap
+        self.box(0, 0, ch, W, "cttop %s %s" % (CH["dot"], socket.gethostname()),
+                 time.strftime("%H:%M:%S"))
+        y = 1
+        pct = "%5.1f%%" % (d["total"] * 100)
+        self.put(y, 2, "CPU", self.c["title"])
+        self.bar(y, 6, iw - 4 - len(pct) - 1, d["total"])
+        self.put(y, W - 2 - len(pct), pct, self.grad(d["total"]) | curses.A_BOLD)
+        y += 1
+        if gh:
+            self.graph(y, 2, gh, iw, self.hist)
+            y += gh
+        lab = len(str(cores[-1][0])) if cores else 1
+        for k, (cid, frac) in enumerate(cores):
+            cx = 2 + (k % ncols) * cell
+            cy = y + k // ncols
+            self.put(cy, cx, str(cid).rjust(lab), self.c["label"])
+            self.bar(cy, cx + lab + 1, cell - lab - 8, frac)
+            self.put(cy, cx + cell - 6, "%3.0f%%" % (frac * 100), self.grad(frac))
+        y += crows
+        info = "%s nucleos" % capn
+        if d["quota"]:
+            info += " (limite %.2g)" % d["quota"]
+        info += "  %s  rodando %d" % (CH["dot"], d["running"])
+        if d["pressure"] is not None:
+            info += "  %s  espera por CPU %.1f%%" % (CH["dot"], d["pressure"])
+        info += "  %s  %d processos, %d threads  %s  up %s" % (
+            CH["dot"], len(d["procs"]), d["threads"], CH["dot"], fmt_uptime(d["uptime"]))
+        self.put(y, 2, info[:iw], self.c["label"])
+
+        # ── memoria ──
+        m = d["mem"]
+        my = ch
+        self.box(my, 0, 4, W, "memoria")
+        tot = m["total"] or 1
+        txt = "%s / %s  %3.0f%%" % (human(m["used"]), human(m["total"]), m["used"] * 100.0 / tot)
+        extra = "  cache %s" % human(m["cache"])
+        if len(txt) + len(extra) + 20 < iw:
+            txt += extra
+        self.put(my + 1, 2, "RAM ", self.c["title"])
+        self.bar(my + 1, 7, iw - 6 - len(txt), m["used"] / tot, m["cache"] / tot)
+        self.put(my + 1, W - 2 - len(txt), txt)
+        self.put(my + 2, 2, "Swap", self.c["title"])
+        if m["swap_total"]:
+            sf = m["swap_used"] / m["swap_total"]
+            txt = "%s / %s  %3.0f%%" % (human(m["swap_used"]), human(m["swap_total"]), sf * 100)
+            self.bar(my + 2, 7, iw - 6 - len(txt), sf)
+            self.put(my + 2, W - 2 - len(txt), txt)
+        else:
+            self.put(my + 2, 7, "sem swap", self.c["label"])
+
+        # ── processos ──
+        py = my + 4
+        ph = H - py
+        if ph < 4:
+            scr.refresh()
+            return
+        self.box(py, 0, ph, W, "processos",
+                 "c/m ordenar %s q sair %s %.1fs" % (CH["dot"], CH["dot"], interval))
+        mark = lambda k: CH["down"] if sort == k else " "
+        head = "%7s %-10s %5s%s %5s%s %7s %9s  %s" % (
+            "PID", "USUARIO", "CPU%", mark("cpu"), "MEM%", mark("rss"), "RES", "TEMPO", "COMANDO")
+        self.put(py + 1, 2, head[:iw], self.c["border"] | curses.A_BOLD)
+        procs = sorted(d["procs"], key=lambda p: (p[sort], p["cpu"], p["rss"]), reverse=True)
+        for k, p in enumerate(procs[:ph - 3]):
+            ry = py + 2 + k
+            mp = p["rss"] / tot
+            self.put(ry, 2, "%7d %-10s" % (p["pid"], p["user"][:10]))
+            self.put(ry, 21, "%5.1f" % (p["cpu"] * 100),
+                     self.grad(p["cpu"]) | (curses.A_BOLD if p["cpu"] >= 0.005 else 0))
+            self.put(ry, 28, "%5.1f" % (mp * 100), self.grad(mp))
+            self.put(ry, 35, "%7s %9s" % (human(p["rss"]), fmt_time(p["ticks"])), self.c["label"])
+            attr = self.c["title"] if p["cpu"] >= 0.005 else 0
+            self.put(ry, 54, p["cmd"][:max(0, W - 56)], attr)
+        scr.refresh()
+
+
+def main(scr, interval):
+    ui = UI(scr)
+    s = Sampler()
+    ui.hist = s.history
+    s.sample()
+    time.sleep(0.25)
+    sort = "cpu"
+    while True:
+        s.sample()
+        ui.draw(s.data, sort, interval)
+        deadline = time.monotonic() + interval
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            scr.timeout(int(left * 1000) + 1)
+            k = scr.getch()
+            if k in (ord("q"), ord("Q"), 27):
+                return
+            if k in (ord("c"), ord("C")):
+                sort = "cpu"
+            elif k in (ord("m"), ord("M")):
+                sort = "rss"
+            elif k == -1:
+                continue
+            ui.draw(s.data, sort, interval)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Monitor de CPU/memoria/processos para containers.")
+    ap.add_argument("-d", "--delay", type=float, default=1.5, help="intervalo em segundos (padrao 1.5)")
+    args = ap.parse_args()
+    locale.setlocale(locale.LC_ALL, "")
+    if "UTF" not in locale.nl_langinfo(locale.CODESET).upper():
+        # CT com LANG=C: tenta UTF-8 mesmo assim; senao cai para ASCII
+        for loc in ("C.UTF-8", "C.utf8", "en_US.UTF-8"):
+            try:
+                locale.setlocale(locale.LC_ALL, loc)
+                break
+            except locale.Error:
+                pass
+        else:
+            CH = ASCII
+    try:
+        curses.wrapper(main, max(0.2, args.delay))
+    except KeyboardInterrupt:
+        pass
