@@ -26,28 +26,6 @@ Monitor de terminal para CTs (LXC): CPUs realmente disponíveis, uso real do con
 
 No terminal as barras têm gradiente verde → amarelo → vermelho.
 
-## Por que isso existe
-
-Eu tenho um servidor Proxmox com muitos núcleos e vários CTs. Cada CT recebe só alguns núcleos, mas o `htop` dentro dele lista **todos os CPUs do host** e marca quase todos como `offl`:
-
-```
-  0[offl]   4[offl]   8[offl]  12[offl]  16[offl]  20[offl]  24[0.0%]
-  1[offl]   5[offl]   9[offl]  13[offl]  17[offl]  21[offl]  25[0.0%]
-  2[offl]   6[offl]  10[offl]  14[offl]  18[offl]  22[offl]  26[0.0%]
-  3[offl]   7[offl]  11[offl]  15[offl]  19[offl]  23[offl]  27[offl]
-```
-
-Metade da tela vira ruído e os poucos núcleos que importam se perdem no meio. A motivação do `cttop` foi essa: **esconder os processadores offline** e mostrar só os que o container pode usar.
-
-No caminho, ele corrige outras duas coisas que o `htop` mostra errado dentro de um CT:
-
-| No `htop` dentro do CT | No `cttop` |
-|---|---|
-| Lista todos os CPUs do host, quase todos `offl` | Só os núcleos liberados para o CT |
-| Load average do host inteiro | Processos rodando e espera por CPU do próprio CT |
-| `CPU%` de processo acima de 100% (ex.: 622%) | `CPU%` relativo à capacidade do CT, de 0 a 100 |
-| Uma linha por thread | Uma linha por processo |
-
 ## Instalação
 
 Precisa só de Python 3, que já vem na maioria dos templates de CT. Nada de `pip`.
@@ -85,6 +63,28 @@ for host in ct1.exemplo.com ct2.exemplo.com; do
   ssh "$host" 'sudo install -m 755 /tmp/cttop /usr/local/bin/cttop && rm /tmp/cttop'
 done
 ```
+
+## Por que isso existe
+
+Eu tenho um servidor Proxmox com muitos núcleos e vários CTs. Cada CT recebe só alguns núcleos, mas o `htop` dentro dele lista **todos os CPUs do host** e marca quase todos como `offl`:
+
+```
+  0[offl]   4[offl]   8[offl]  12[offl]  16[offl]  20[offl]  24[0.0%]
+  1[offl]   5[offl]   9[offl]  13[offl]  17[offl]  21[offl]  25[0.0%]
+  2[offl]   6[offl]  10[offl]  14[offl]  18[offl]  22[offl]  26[0.0%]
+  3[offl]   7[offl]  11[offl]  15[offl]  19[offl]  23[offl]  27[offl]
+```
+
+Metade da tela vira ruído e os poucos núcleos que importam se perdem no meio. A motivação do `cttop` foi essa: **esconder os processadores offline** e mostrar só os que o container pode usar.
+
+No caminho, ele corrige outras duas coisas que o `htop` mostra errado dentro de um CT:
+
+| No `htop` dentro do CT | No `cttop` |
+|---|---|
+| Lista todos os CPUs do host, quase todos `offl` | Só os núcleos liberados para o CT |
+| Load average do host inteiro | Processos rodando e espera por CPU do próprio CT |
+| `CPU%` de processo acima de 100% (ex.: 622%) | `CPU%` relativo à capacidade do CT, de 0 a 100 |
+| Uma linha por thread | Uma linha por processo |
 
 ## Uso
 
